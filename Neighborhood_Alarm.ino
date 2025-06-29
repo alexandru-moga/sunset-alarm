@@ -1,77 +1,133 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include <SPI.h>
 #include <MFRC522.h>
+#include <IRremoteESP8266.h>
+#include <IRrecv.h>
+#include <IRutils.h>
 
-#define SS_PIN 53
-#define RST_PIN 5
-#define PIR_PIN 2
-#define BUZZER_PIN 3
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
 
-MFRC522 mfrc522(SS_PIN, RST_PIN);
+const char* apiUrl = "http://192.168.1.144/alarm";
 
-bool alarmActive = false;
+#define PIR_PIN 22
 
-const char* authorizedUIDs[] = {
-  "27B98166",
-  "04C8DE2B475980",
-  "040F622A7A1690",
-  "0493C42B475980"
-};
-const int authorizedCount = sizeof(authorizedUIDs) / sizeof(authorizedUIDs[0]);
+#define US1_TRIG 17
+#define US1_ECHO 16
+#define US2_TRIG 4
+#define US2_ECHO 15
 
-String getUIDString(MFRC522::Uid *uid) {
-  String uidStr = "";
-  for (byte i = 0; i < uid->size; i++) {
-    if (uid->uidByte[i] < 0x10) uidStr += "0";
-    uidStr += String(uid->uidByte[i], HEX);
-  }
-  uidStr.toUpperCase();
-  return uidStr;
+#define IR_PIN 21
+
+#define BUZZER_PIN 2
+
+#define RGB_RED 25
+#define RGB_GREEN 26
+#define RGB_BLUE 27
+
+#define RFID_SS_PIN 5
+#define RFID_RST_PIN 0
+
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+
+IRrecv irrecv(IR_PIN, 1024, 15, true);
+decode_results results;
+
+bool alarmTriggered = false;
+unsigned long lastTriggerTime = 0;
+
+void setRGB(uint8_t r, uint8_t g, uint8_t b) {
+  analogWrite(RGB_RED, r);
+  analogWrite(RGB_GREEN, g);
+  analogWrite(RGB_BLUE, b);
 }
 
-bool isAuthorized(String uidStr) {
-  for (int i = 0; i < authorizedCount; i++) {
-    if (uidStr == authorizedUIDs[i]) {
-      return true;
+void triggerAlarm(const char* cause) {
+  if (!alarmTriggered) {
+    alarmTriggered = true;
+    lastTriggerTime = millis();
+    digitalWrite(BUZZER_PIN, HIGH);
+    setRGB(255, 0, 0);
+    Serial.printf("ALARM TRIGGERED by %s\n", cause);
+
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      http.begin(apiUrl);
+      http.addHeader("Content-Type", "application/json");
+      String payload = String("{\"cause\":\"") + cause + "\"}";
+      int httpCode = http.POST(payload);
+      Serial.printf("API POST code: %d\n", httpCode);
+      http.end();
     }
   }
-  return false;
+}
+
+float readUltrasonic(uint8_t trigPin, uint8_t echoPin) {
+  digitalWrite(trigPin, LOW); delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  return duration * 0.034 / 2;
 }
 
 void setup() {
-  Serial.begin(9600);
-  SPI.begin();
-  mfrc522.PCD_Init();
+  Serial.begin(115200);
+
   pinMode(PIR_PIN, INPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-  Serial.println("System Ready. Waiting for motion...");
+  pinMode(US1_TRIG, OUTPUT); pinMode(US1_ECHO, INPUT);
+  pinMode(US2_TRIG, OUTPUT); pinMode(US2_ECHO, INPUT);
+  pinMode(IR_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, LOW);
+  pinMode(RGB_RED, OUTPUT); pinMode(RGB_GREEN, OUTPUT); pinMode(RGB_BLUE, OUTPUT);
+
+  setRGB(0, 0, 255); 
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi connected");
+
+  SPI.begin();
+  rfid.PCD_Init();
+
+  irrecv.enableIRIn();
+
+  setRGB(0, 255, 0);
 }
 
 void loop() {
-  if (digitalRead(PIR_PIN) == HIGH && !alarmActive) {
-    Serial.println("Motion detected! Alarm activated.");
-    alarmActive = true;
-    digitalWrite(BUZZER_PIN, HIGH);
+  if (digitalRead(PIR_PIN) == HIGH) {
+    triggerAlarm("PIR");
   }
 
-  if (alarmActive) {
-    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-      String uidStr = getUIDString(&mfrc522.uid);
-      Serial.print("Scanned UID: ");
-      Serial.println(uidStr);
+  float us1 = readUltrasonic(US1_TRIG, US1_ECHO);
+  float us2 = readUltrasonic(US2_TRIG, US2_ECHO);
+  if ((us1 > 0 && us1 < 50) || (us2 > 0 && us2 < 50)) {
+    triggerAlarm("Ultrasonic");
+  }
 
-      if (isAuthorized(uidStr)) {
-        Serial.println("Authorized card! Alarm deactivated.");
-        alarmActive = false;
-        digitalWrite(BUZZER_PIN, LOW);
-        delay(1000);
-      } else {
-        Serial.println("Unauthorized card.");
-      }
-      mfrc522.PICC_HaltA();
-      mfrc522.PCD_StopCrypto1();
-    }
-  } else {
+  if (irrecv.decode(&results)) {
+    triggerAlarm("IR");
+    Serial.printf("IR code: 0x%X\n", results.value);
+    irrecv.resume();
+  }
+
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    Serial.print("RFID UID: ");
+    for (byte i = 0; i < rfid.uid.size; i++) Serial.printf("%02X ", rfid.uid.uidByte[i]);
+    Serial.println();
+    triggerAlarm("RFID");
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+  }
+
+  if (alarmTriggered && millis() - lastTriggerTime > 10000) {
+    alarmTriggered = false;
     digitalWrite(BUZZER_PIN, LOW);
+    setRGB(0, 255, 0);
+    Serial.println("Alarm reset");
   }
+
+  delay(100);
 }
